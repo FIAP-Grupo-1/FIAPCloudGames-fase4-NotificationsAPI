@@ -52,3 +52,73 @@ jobs:
             git status
             exit 1
           fi
+
+  # CD: depois do merge na main, publica as duas Lambdas com o SAM (stack
+  # fcg-notifications-serverless). Sem access key: o GitHub assume a role
+  # fcg-gha-notifications por OIDC, e quem aplica o change set é a role de serviço
+  # fcg-cfn-notifications, limitada aos recursos fcg-notifications* (as duas roles
+  # ficam no Orchestration, infra/cloudformation/github-oidc.yaml).
+  # O AutoPublishAlias do template publica uma versão nova e move o alias "prod" para
+  # ela: a fila SQS passa a entregar para o código novo sem parar de consumir.
+  deploy:
+    name: Deploy da Lambda (SAM)
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: deploy-notifications
+      cancel-in-progress: false
+    env:
+      AWS_REGION: us-east-1
+      STACK_NAME: fcg-notifications-serverless
+      # ARNs não são segredo (valores dos outputs da stack fcg-github-oidc).
+      AWS_ROLE_ARN: arn:aws:iam::450753703903:role/fcg-gha-notifications
+      CFN_ROLE_ARN: arn:aws:iam::450753703903:role/fcg-cfn-notifications
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Credenciais AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: sam build
+        run: sam build
+
+      - name: sam deploy
+        # samconfig.toml traz stack, região, bucket (resolve_s3) e parâmetros.
+        run: |
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --role-arn "$CFN_ROLE_ARN"
+
+      - name: Resumo do deploy
+        if: always()
+        run: |
+          {
+            echo "### Deploy da Lambda"
+            echo ""
+            echo "| Função | Versão no alias prod |"
+            echo "|---|---|"
+            for f in fcg-notifications-user-registered fcg-notifications-payment-processed; do
+              v=$(aws lambda get-alias --function-name "$f" --name prod --query FunctionVersion --output text 2>/dev/null || echo "?")
+              echo "| \`$f\` | $v |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
